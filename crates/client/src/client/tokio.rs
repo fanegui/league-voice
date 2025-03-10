@@ -14,7 +14,7 @@ use tokio::{
 };
 
 pub struct TokioClient<A: SoundProcessor, D: DeviceHandler> {
-    audio_handler: Arc<A>,
+    audio_handler: A,
     device_handler: D,
 
     stop_tx: Option<oneshot::Sender<()>>,
@@ -32,13 +32,12 @@ impl<A: SoundProcessor + 'static, D: DeviceHandler + 'static> Client<A, D> for T
         let (packet_sender, mut message_receiver) = mpsc::channel::<Packet>(32);
         let (chan_output_tx, chan_output_rx) = broadcast::channel::<Vec<f32>>(32);
 
-        let audio_handler: Arc<A> = Arc::new(A::new()?);
-        let audio_handler_clone = audio_handler.clone();
+        let audio_handler = A::new()?;
+        let codec = audio_handler.get_codec();
         let (mut read, mut write) = stream.into_split();
 
         let read_handle = tokio::spawn(async move {
             println!("Started reading from server");
-            let audio_handler = audio_handler_clone.clone();
             let mut buffer = Vec::with_capacity(MAX_PACKET_SIZE * 2);
             loop {
                 let mut temp_buffer = [0; MAX_PACKET_SIZE];
@@ -51,8 +50,7 @@ impl<A: SoundProcessor + 'static, D: DeviceHandler + 'static> Client<A, D> for T
                 loop {
                     let packet = match Packet::decode(&mut buffer) {
                         Ok(packet) => packet,
-                        Err(err) => {
-                            println!("Failed to decode packet {:?}", err);
+                        Err(_) => {
                             break;
                         }
                     };
@@ -65,7 +63,7 @@ impl<A: SoundProcessor + 'static, D: DeviceHandler + 'static> Client<A, D> for T
                         PacketId::AudioPacket => {
                             AudioPacketHandler::handle_packet(
                                 packet,
-                                audio_handler.get_codec(),
+                                codec.clone(),
                                 chan_output_tx.clone(),
                             )
                             .await?;
@@ -135,9 +133,9 @@ impl<A: SoundProcessor + 'static, D: DeviceHandler + 'static> Client<A, D> for T
             )?;
         }
 
-        let audio_handler = self.audio_handler.clone();
-        let packet_sender = self.packet_sender.clone();
-        let _ = audio_handler.start(mic_rx, packet_sender).await;
+        self.audio_handler
+            .start(mic_rx, self.packet_sender.clone())
+            .await?;
 
         let chan_output_rx = self.chan_output_rx.clone();
         let output_handle = tokio::spawn(async move {
@@ -183,11 +181,11 @@ impl<A: SoundProcessor + 'static, D: DeviceHandler + 'static> Client<A, D> for T
             Err(_) => {
                 panic!("Failed to send stop signal");
             }
-        }
-
+        };
         self.stop_tx = None;
-        self.audio_handler.stop().await;
+
         self.device_handler.stop()?;
+        self.audio_handler.stop().await?;
 
         Ok(())
     }

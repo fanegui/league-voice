@@ -4,18 +4,17 @@ use common::packet::{AudioPacket, Packet};
 use std::sync::Arc;
 use std::u32;
 use tokio::{
-    join,
+    select,
     sync::{
-        broadcast,
         mpsc::{self},
-        Mutex,
+        oneshot, Mutex,
     },
 };
 
 pub struct AudioProcessor<Codec: AudioCodec> {
     codec: Arc<Mutex<Codec>>,
 
-    stop_tx: Arc<Mutex<Option<broadcast::Sender<()>>>>,
+    stop_tx: Option<oneshot::Sender<()>>,
 }
 
 impl<Codec: AudioCodec> AudioProcessor<Codec> {}
@@ -27,70 +26,70 @@ impl<Codec: AudioCodec + 'static> SoundProcessor for AudioProcessor<Codec> {
     fn new() -> Result<Self, ClientError> {
         Ok(AudioProcessor {
             codec: Arc::new(Mutex::new(Codec::new()?)),
-            stop_tx: Arc::new(Mutex::new(None)),
+            stop_tx: None,
         })
     }
 
     async fn start(
-        &self,
+        &mut self,
         mut mic_rx: mpsc::Receiver<Vec<f32>>,
         packet_sender: mpsc::Sender<Packet>,
-    ) {
+    ) -> Result<(), ClientError> {
         println!("Starting audio handler");
-
-        let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(20);
-        let codec = self.codec.clone();
-        let (stop_tx, mut stop_rx) = broadcast::channel::<()>(1);
-        let mut stop_rx_clone = stop_rx.resubscribe();
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
         {
-            *self.stop_tx.lock().await = Some(stop_tx);
+            self.stop_tx = Some(stop_tx);
         }
 
+        let codec = self.codec.clone();
+        let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(20);
         let microphone_handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    Some(audio_samples) = mic_rx.recv() => {
-                        match codec.lock().await.encode(audio_samples){
-                            Ok(encoded_data) => {
-                                let _ = audio_tx.send(encoded_data).await;
-                            },
-                            Err(e) =>{
-                                println!("Failed to encode audio samples {:?}", e);
-                            }
-                        };
+            while let Some(audio_samples) = mic_rx.recv().await {
+                match codec.lock().await.encode(audio_samples) {
+                    Ok(encoded_data) => {
+                        let _ = audio_tx.send(encoded_data).await;
                     }
-                    _ = stop_rx.recv() => break
-                }
+                    Err(e) => {
+                        println!("Failed to encode audio samples {:?}", e);
+                    }
+                };
             }
         });
 
         let audio_packets_handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    Some(track) = audio_rx.recv() => {
-                        let _ = packet_sender.send(Packet::new(AudioPacket { track })).await;
-                    }
-                    _ = stop_rx_clone.recv() => break
-                }
+            while let Some(track) = audio_rx.recv().await {
+                let _ = packet_sender.send(Packet::new(AudioPacket { track })).await;
             }
         });
 
         tokio::spawn(async move {
-            match join!(microphone_handle, audio_packets_handle) {
-                _ => {}
-            };
+            select! {
+                _ = microphone_handle => {
+                }
+                _ = audio_packets_handle => {
+                }
+                _ = stop_rx => {
+                }
+            }
         });
+
+        Ok(())
     }
 
-    async fn stop(&self) {
-        let mut stop_tx = self.stop_tx.lock().await;
-        if stop_tx.is_none() {
-            println!("Audio handler is not running");
-            return;
-        }
+    async fn stop(&mut self) -> Result<(), ClientError> {
+        let stop_tx = match self.stop_tx.take() {
+            Some(stop_tx) => stop_tx,
+            None => return Ok(()),
+        };
 
-        let _ = stop_tx.take().unwrap().send(());
-        println!("Stopped audio handler");
+        match stop_tx.send(()) {
+            Ok(_) => {
+                return Ok(());
+            }
+            Err(_) => {
+                return Err(ClientError::PoisonedLock);
+            }
+        }
     }
 
     fn get_codec(&self) -> Arc<Mutex<Codec>> {
@@ -107,7 +106,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_audio_handler() {
-        let audio_handler = AudioProcessor::<OpusAudioCodec>::new().unwrap();
+        let mut audio_handler = AudioProcessor::<OpusAudioCodec>::new().unwrap();
         {
             audio_handler
                 .get_codec()
@@ -141,7 +140,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
     async fn test_audio_handler_stop() {
-        let audio_handler = AudioProcessor::<OpusAudioCodec>::new().unwrap();
+        let mut audio_handler = AudioProcessor::<OpusAudioCodec>::new().unwrap();
         {
             audio_handler
                 .get_codec()
@@ -151,22 +150,17 @@ mod tests {
                 .unwrap();
         }
 
-        let audio_handler = Arc::new(audio_handler);
-        let audio_handler_clone = audio_handler.clone();
-
         let (mic_tx, mic_rx) = mpsc::channel::<Vec<f32>>(1);
         let (packet_tx, mut packet_rx) = mpsc::channel::<Packet>(1);
 
-        tokio::spawn(async move {
-            let _ = audio_handler.clone().start(mic_rx, packet_tx).await;
-        });
+        let _ = audio_handler.start(mic_rx, packet_tx).await;
 
         let audio_samples = vec![10.0; 480];
         tokio::spawn(async move {
             for _ in 0..10 {
                 let _ = mic_tx.send(audio_samples.clone()).await;
                 sleep(Duration::from_millis(10)).await;
-                let _ = audio_handler_clone.stop().await;
+                let _ = audio_handler.stop().await;
             }
         });
 
@@ -180,7 +174,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_audio_handler_stereo() {
-        let audio_handler = AudioProcessor::<OpusAudioCodec>::new().unwrap();
+        let mut audio_handler = AudioProcessor::<OpusAudioCodec>::new().unwrap();
         {
             audio_handler
                 .get_codec()
@@ -193,9 +187,7 @@ mod tests {
         let (mic_tx, mic_rx) = mpsc::channel::<Vec<f32>>(20);
         let (packet_tx, mut packet_rx) = mpsc::channel::<Packet>(20);
 
-        tokio::spawn(async move {
-            let _ = audio_handler.start(mic_rx, packet_tx).await;
-        });
+        let _ = audio_handler.start(mic_rx, packet_tx).await;
 
         let audio_samples = vec![10.0; 480 * 2];
         tokio::spawn(async move {
@@ -214,7 +206,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_audio_handler_invalid_packet() {
-        let audio_handler = AudioProcessor::<OpusAudioCodec>::new().unwrap();
+        let mut audio_handler = AudioProcessor::<OpusAudioCodec>::new().unwrap();
         {
             audio_handler
                 .get_codec()
@@ -227,9 +219,7 @@ mod tests {
         let (mic_tx, mic_rx) = mpsc::channel::<Vec<f32>>(20);
         let (packet_tx, mut packet_rx) = mpsc::channel::<Packet>(20);
 
-        tokio::spawn(async move {
-            let _ = audio_handler.start(mic_rx, packet_tx).await;
-        });
+        let _ = audio_handler.start(mic_rx, packet_tx).await;
 
         let audio_samples = vec![10.0; 4890];
         tokio::spawn(async move {

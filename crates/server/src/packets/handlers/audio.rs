@@ -20,7 +20,7 @@ impl PacketHandler for AudioHandler {
         let encoded_packet = Packet::new(packet).encode();
 
         for client in self.0.lock().await.values() {
-            if client.id() != data.client_id {
+            if client.id() == data.client_id {
                 client.send(&encoded_packet).await?;
             }
         }

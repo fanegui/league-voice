@@ -27,43 +27,41 @@ async fn manage_window<R: Runtime>(state: WindowState, window: Window<R>) {
 }
 
 #[tauri::command]
-async fn start(state: State<'_, Mutex<AppState>>) -> Result<(), String> {
-    let mut state = state.inner().lock().await;
-
-    match state.client.run().await {
-        Ok(_) => {}
-        Err(e) => return Err(e.to_string()),
-    }
-
-    Ok(())
+async fn start(state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .client
+        .lock()
+        .await
+        .run()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn stop(state: State<'_, Mutex<AppState>>) -> Result<(), String> {
-    let mut state = state.inner().lock().await;
-
-    match state.client.stop().await {
-        Ok(_) => {}
-        Err(e) => return Err(e.to_string()),
-    }
-
-    Ok(())
+async fn stop(state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .client
+        .lock()
+        .await
+        .stop()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn is_running(state: State<'_, Mutex<AppState>>) -> Result<bool, String> {
-    let state = state.inner().lock().await;
-    Ok(state.client.is_running().await)
+async fn is_running(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.client.lock().await.is_running().await)
 }
 
 #[tauri::command]
 async fn get_devices(state: State<'_, Mutex<AppState>>) -> Result<String, String> {
     let state = state.inner().lock().await;
 
-    let audio_handler = state.client.device_handler();
+    let client = state.client.lock().await;
+    let device_handler = client.device_handler();
 
-    let out_devices = audio_handler.get_devices(client::audio::DeviceType::Output);
-    let in_devices = audio_handler.get_devices(client::audio::DeviceType::Input);
+    let out_devices = device_handler.get_devices(client::audio::DeviceType::Output);
+    let in_devices = device_handler.get_devices(client::audio::DeviceType::Input);
 
     let mut devices = vec![];
     devices.extend(out_devices);
@@ -78,12 +76,12 @@ async fn get_devices(state: State<'_, Mutex<AppState>>) -> Result<String, String
 async fn set_device(
     device_type: DeviceType,
     device_name: String,
-    state: State<'_, Mutex<AppState>>,
+    state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let mut state = state.inner().lock().await;
-    state.client.stop().await.unwrap();
+    let mut client = state.client.lock().await;
+    client.stop().await.unwrap();
 
-    let audio_handler = state.client.device_handler_mut();
+    let audio_handler = client.device_handler_mut();
     match audio_handler.set_active_device(&device_type, device_name) {
         Ok(_) => {}
         Err(e) => return Err(e.to_string()),
@@ -93,7 +91,7 @@ async fn set_device(
 }
 
 struct AppState {
-    client: TokioClient<AudioProcessor<OpusAudioCodec>, CpalDeviceHandler>,
+    client: Mutex<TokioClient<AudioProcessor<OpusAudioCodec>, CpalDeviceHandler>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -117,7 +115,9 @@ pub fn run() {
                 }
             };
 
-            app.manage(Mutex::new(AppState { client }));
+            app.manage(AppState {
+                client: Mutex::new(client),
+            });
 
             Ok(())
         })

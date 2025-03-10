@@ -44,8 +44,12 @@ impl DeviceInfo {
 pub trait SoundProcessor: Send + Sync + Sized {
     type Codec: AudioCodec;
     fn new() -> Result<Self, ClientError>;
-    async fn start(&self, mut mic_rx: Receiver<Vec<f32>>, packet_sender: Sender<Packet>);
-    async fn stop(&self);
+    async fn start(
+        &mut self,
+        mut mic_rx: Receiver<Vec<f32>>,
+        packet_sender: Sender<Packet>,
+    ) -> Result<(), ClientError>;
+    async fn stop(&mut self) -> Result<(), ClientError>;
     fn get_codec(&self) -> Arc<Mutex<Self::Codec>>;
 }
 
