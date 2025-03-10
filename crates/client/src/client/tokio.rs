@@ -137,10 +137,7 @@ impl<A: SoundProcessor + 'static, D: DeviceHandler + 'static> Client<A, D> for T
 
         let audio_handler = self.audio_handler.clone();
         let packet_sender = self.packet_sender.clone();
-        let microphone_handle = tokio::spawn(async move {
-            let _ = audio_handler.start(mic_rx, packet_sender).await;
-            println!("audio stop")
-        });
+        let _ = audio_handler.start(mic_rx, packet_sender).await;
 
         let chan_output_rx = self.chan_output_rx.clone();
         let output_handle = tokio::spawn(async move {
@@ -153,20 +150,18 @@ impl<A: SoundProcessor + 'static, D: DeviceHandler + 'static> Client<A, D> for T
             Ok::<(), ClientError>(())
         });
 
-        select! {
-            Ok(microphone_result) = microphone_handle => {
-                println!("Microphone result: {:?}", microphone_result);
-                Ok(())
+        tokio::spawn(async move {
+            select! {
+                Ok(stop_result) = stop_rx => {
+                    println!("Stop result: {:?}", stop_result);
+                }
+                Ok(output_result) = output_handle => {
+                    println!("Output result: {:?}", output_result);
+                }
             }
-            Ok(stop_result) = stop_rx => {
-                println!("Stop result: {:?}", stop_result);
-                Ok(())
-            }
-            Ok(output_result) = output_handle => {
-                println!("Output result: {:?}", output_result);
-                Ok(())
-            }
-        }
+        });
+
+        Ok(())
     }
 
     fn device_handler(&self) -> &D {

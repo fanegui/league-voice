@@ -75,9 +75,11 @@ impl<Codec: AudioCodec + 'static> SoundProcessor for AudioProcessor<Codec> {
             }
         });
 
-        match join!(microphone_handle, audio_packets_handle) {
-            _ => {}
-        };
+        tokio::spawn(async move {
+            match join!(microphone_handle, audio_packets_handle) {
+                _ => {}
+            };
+        });
     }
 
     async fn stop(&self) {
